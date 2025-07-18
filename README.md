@@ -74,7 +74,7 @@ Visualization is powered by PyGame and can be toggled on/off in real time to spe
 * View metrics in real-time with:
 
   ```bash
-  tensorboard --logdir=logs/
+  tensorboard --logdir logs
   ```
 * Debug unexpected behavior (like reward exploits) using the live PyGame view
 
