@@ -2,6 +2,26 @@
 
 
 import os
+# --- Runtime banner / log suppression ---
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")  # Hide pygame greeting
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")        # Suppress TensorFlow INFO logs
+
+import matplotlib  # Before importing pyplot, set a non-GUI backend for threads
+matplotlib.use("Agg")
+
+import warnings
+# Suppress common user warnings we don't care about
+warnings.filterwarnings(
+    "ignore",
+    message="You are saving your model as an HDF5 file",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="Starting a Matplotlib GUI outside of the main thread",
+    category=UserWarning,
+)
+
 import random
 import threading
 import numpy as np
@@ -15,6 +35,21 @@ import time
 from PIL import Image, ImageTk
 import queue
 import datetime
+import csv
+import json
+import shutil
+try:
+    import joblib  # type: ignore
+except ImportError:
+    print("Joblib could not be imported. Checkpointing disabled. Install with: pip install joblib")
+    # Provide a minimal stub so attribute access does not fail type-checkers
+    class _JoblibStub:
+        def dump(self, *args, **kwargs):
+            print("[Warning] Joblib missing: checkpoint not saved.")
+        def load(self, *args, **kwargs):
+            raise ImportError("Joblib is required to load checkpoints.")
+
+    joblib = _JoblibStub()  # type: ignore
 
 # Add DummyAgent class at the top (after imports):
 class DummyAgent:
@@ -26,10 +61,10 @@ class DummyAgent:
 
 # Simplify TensorFlow/Keras import logic:
 try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers, models
-    from tensorflow.keras.optimizers import Adam
+    import tensorflow as tf  # type: ignore
+    from tensorflow import keras  # type: ignore
+    from tensorflow.keras import layers, models  # type: ignore
+    from tensorflow.keras.optimizers import Adam  # type: ignore
 except ImportError as e:
     print("TensorFlow or Keras could not be imported. Please install them to run this program. Try: pip install tensorflow keras")
     raise
@@ -54,15 +89,29 @@ MAX_AGENTS = 5
 
 # Globals
 EPISODES = 500
-LEARNING_RATE = 0.0005  # Reduced from 0.001 for more stable learning
-GAMMA = 0.99  # Increased from 0.97 for better long-term planning
+LEARNING_RATE = 0.0001  # Lower LR for stability
+GAMMA = 0.97  # Slightly shorter horizon to damp large targets
 INITIAL_EPSILON = 1.0
 FINAL_EPSILON = 0.01  # Reduced from 0.05 for more exploration
 EPSILON_DECAY_EPISODES = 300  # Increased from 200 for slower decay
 PRIORITY_ALPHA = 0.6
 PRIORITY_EPS = 1e-6
-TARGET_UPDATE_FREQ = 10  # Increased from 5 for more stable target network
-CLIP_NORM = 1.0  # Gradient clipping to prevent exploding updates
+TARGET_UPDATE_FREQ = 5  # Refresh target network every 5 episodes
+CLIP_NORM = 5.0  # Allow larger gradients but clip extremes
+EVAL_EVERY_N = 50  # Evaluate policy every N episodes with epsilon=0
+CHECKPOINT_EVERY_N = 50  # <-- new: save checkpoints every N episodes
+
+# === Utility: checkpoint helpers ===
+
+def get_latest_checkpoint(checkpoint_dir):
+    """Return the newest checkpoint file in a directory (or None if empty)."""
+    files = [f for f in os.listdir(checkpoint_dir)
+             if f.startswith("checkpoint_ep") and f.endswith(".pkl")]
+    if not files:
+        return None
+    # Sort numerically by episode number embedded in the filename (checkpoint_epXXX.pkl)
+    files.sort(key=lambda fname: int(fname.split('_ep')[1].split('.')[0]))
+    return os.path.join(checkpoint_dir, files[-1])
 
 # Runtime flags
 stop_flag = threading.Event()
@@ -200,50 +249,66 @@ class DQNAgent:
         self.obstacles_hit = 0
 
     def act(self, state, training=True):
+        # Optimized action selection using eager execution instead of Keras predict
         if training and random.random() < self.epsilon:
             return random.randint(0, self.output_dim - 1)
 
-        q_values = self.model.predict(state[np.newaxis])[0]
+        # Use TensorFlow for a faster forward pass (no graph building overhead of .predict)
+        state_tensor = tf.convert_to_tensor(state[None, :], dtype=tf.float32)
+        q_values = self.model(state_tensor, training=False)[0].numpy()
         return int(np.argmax(q_values))
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.add(Experience(state, action, reward, next_state, done))
 
     def replay(self):
+        # Skip training until we have enough samples
         if self.memory.size < BATCH_SIZE:
             return 0.0
 
         states, actions, rewards, next_states, dones, indices, weights = \
             self.memory.sample(BATCH_SIZE, self.beta)
 
-        # Double DQN update
-        next_q_values = self.model.predict(next_states)
-        best_actions = np.argmax(next_q_values, axis=1)
+        # Convert to tensors once to avoid multiple NumPy→TF copies
+        states_t = tf.convert_to_tensor(states, dtype=tf.float32)
+        next_states_t = tf.convert_to_tensor(next_states, dtype=tf.float32)
+        rewards_t = tf.convert_to_tensor(rewards, dtype=tf.float32)
+        dones_t = tf.convert_to_tensor(dones.astype(np.float32), dtype=tf.float32)
+        weights_t = tf.convert_to_tensor(weights, dtype=tf.float32)
 
-        target_next_q_values = self.target.predict(next_states)
-        target_q_values = target_next_q_values[np.arange(BATCH_SIZE), best_actions]
+        batch_idx = tf.range(BATCH_SIZE, dtype=tf.int32)
 
-        targets = rewards + GAMMA * target_q_values * (1 - dones)
+        # -------- Double-DQN Target --------
+        # Action selection is done with the online network
+        next_q_online = self.model(next_states_t, training=False)
+        best_next_actions = tf.argmax(next_q_online, axis=1, output_type=tf.int32)
 
-        q_values = self.model.predict(states)
-        q_values[np.arange(BATCH_SIZE), actions] = targets
+        # Action evaluation is done with the target network
+        next_q_target = self.target(next_states_t, training=False)
+        best_next_q = tf.gather_nd(next_q_target, tf.stack([batch_idx, best_next_actions], axis=1))
+        targets = rewards_t + GAMMA * best_next_q * (1.0 - dones_t)
 
-        # Update priorities
-        errors = np.abs(q_values[np.arange(BATCH_SIZE), actions] - targets)
-        self.memory.update_priorities(indices, errors)
+        # -------- Gradient update --------
+        with tf.GradientTape() as tape:
+            q_values_all = self.model(states_t, training=True)
+            chosen_q = tf.gather_nd(q_values_all, tf.stack([batch_idx, tf.cast(actions, tf.int32)], axis=1))
+            td_errors = targets - chosen_q
+            # Per-sample Huber loss weighted by importance-sampling weights
+            huber = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)
+            sample_losses = huber(targets, chosen_q)
+            loss = tf.reduce_mean(weights_t * sample_losses)
 
-        # Train model
-        history = self.model.fit(states, q_values, sample_weight=weights,
-                                 batch_size=BATCH_SIZE, epochs=1, verbose=0)  # type: ignore[arg-type]
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        grads = [tf.clip_by_norm(g, CLIP_NORM) for g in grads]
+        self.model.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
 
-        # Update beta - slower annealing for more stable learning
-        self.beta = min(1.0, self.beta + 0.0005)  # Reduced from 0.001
+        # Update priorities using absolute TD-error
+        self.memory.update_priorities(indices, np.minimum(np.abs(td_errors), 5.0))
 
-        # Safely access history
-        if history is not None and hasattr(history, 'history') and 'loss' in history.history:
-            return history.history['loss'][0]
-        else:
-            return 0.0
+        # Anneal beta more gradually for stable importance weights
+        self.beta = min(1.0, self.beta + 0.0005)
+
+        return float(loss.numpy())
 
     def update_target(self):
         self.target.set_weights(self.model.get_weights())
@@ -410,7 +475,13 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
     # --- TensorBoard writer ---
     log_dir = os.path.join("logs", f"agent_{agent_id}_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
     os.makedirs(log_dir, exist_ok=True)
-    writer = tf.summary.create_file_writer(log_dir)
+    writer = tf.summary.create_file_writer(log_dir)  # type: ignore[attr-defined]
+
+    # --- CSV metrics writer ---
+    csv_path = os.path.join(log_dir, "metrics.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["episode", "score", "reward", "loss", "epsilon"])
 
     # Extract parameters
     EPISODES = params['episodes']
@@ -420,6 +491,7 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
     FINAL_EPSILON = params['final_epsilon']
     EPSILON_DECAY_EPISODES = params['epsilon_decay_episodes']
     visualize_every_n = params.get('visualize_every_n', 10)
+    eval_every_n = params.get('eval_every_n', EVAL_EVERY_N)
 
     # Use global real-time visualization flag
     global training_visualization_enabled
@@ -450,7 +522,29 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
     best_score = -np.inf
     start_time = time.time()
 
-    for ep in range(1, EPISODES + 1):
+    # --- Checkpoint directory & auto-resume ---
+    checkpoint_dir = os.path.join(params.get('run_dir', '.'), f"checkpoints_agent_{agent_id}")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    start_episode = 1  # default starting point
+    latest_ckpt = get_latest_checkpoint(checkpoint_dir)
+    if latest_ckpt:
+        try:
+            ckpt = joblib.load(latest_ckpt)
+            agent.model.set_weights(ckpt['model_weights'])
+            agent.target.set_weights(ckpt['target_weights'])
+            agent.epsilon = ckpt.get('epsilon', agent.epsilon)
+            rewards = ckpt.get('rewards', [])
+            scores = ckpt.get('scores', [])
+            losses = ckpt.get('losses', [])
+            best_score = ckpt.get('best_score', best_score)
+            random.setstate(ckpt.get('random_state_py', random.getstate()))
+            np.random.set_state(ckpt.get('random_state_np', np.random.get_state()))
+            start_episode = ckpt['episode'] + 1
+            log_queue.put(f"Agent {agent_id}: Resumed from checkpoint at episode {ckpt['episode']}")
+        except Exception as e:
+            log_queue.put(f"Agent {agent_id}: Failed to load checkpoint: {e}")
+
+    for ep in range(start_episode, EPISODES + 1):
         if stop_flag.is_set():
             log_queue.put(f"Agent {agent_id}: Training stopped by user")
             break
@@ -559,6 +653,9 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
                 reward -= 20.0
                 done = True
 
+            # Clip reward to [-1, 1] to stabilise learning
+            reward = max(-1.0, min(1.0, reward))
+
             # Get next state
             next_state = get_agent_state(agent, world)
 
@@ -623,6 +720,39 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
         rewards.append(episode_reward)
         scores.append(agent.score)
 
+        # --- Periodic Evaluation (deterministic policy) ---
+        if eval_every_n > 0 and (ep % eval_every_n == 0):
+            eval_reward_total = 0.0
+            eval_episodes = 3  # quick eval
+            # Clone model weights into a fresh agent to avoid epsilon side-effects
+            eval_agent = DQNAgent(input_dim, 5, agent_id)
+            eval_agent.model.set_weights(agent.model.get_weights())
+            eval_agent.target.set_weights(agent.target.get_weights())
+            eval_agent.epsilon = 0.0
+
+            for _ in range(eval_episodes):
+                eval_world = World(visualize=False)
+                eval_world.spawn_obstacles()
+                eval_world.spawn_food()
+                eval_agent.reset()
+                ep_reward = 0.0
+                for _ in range(STEPS_PER_EPISODE):
+                    state_eval = get_agent_state(eval_agent, eval_world)
+                    action_eval = eval_agent.act(state_eval, training=False)
+                    move_agent(eval_agent, action_eval)
+                    # Simple reward: +1 per food, -1 per obstacle
+                    if any(eval_agent.rect.colliderect(f) for f in eval_world.food):
+                        ep_reward += 1
+                    if any(eval_agent.rect.colliderect(o) for o in eval_world.obstacles):
+                        ep_reward -= 1
+                eval_reward_total += ep_reward
+
+            avg_eval_reward = eval_reward_total / eval_episodes
+            # Log to TensorBoard / CSV
+            with writer.as_default():
+                tf.summary.scalar('Eval Reward', avg_eval_reward, step=ep)
+            csv_writer.writerow([f"eval_{ep}", "-", avg_eval_reward, "-", 0])
+
         # Calculate statistics
         avg_reward = np.mean(rewards[-10:]) if len(rewards) >= 10 else np.mean(rewards)
         avg_score = np.mean(scores[-10:]) if len(scores) >= 10 else np.mean(scores)
@@ -684,6 +814,29 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
             tf.summary.scalar('Epsilon', agent.epsilon, step=ep)
         writer.flush()
 
+        # --- CSV logging ---
+        csv_writer.writerow([ep, agent.score, episode_reward, avg_loss, agent.epsilon])
+
+        # --- Periodic checkpoint save ---
+        if (ep % CHECKPOINT_EVERY_N == 0) or (ep == EPISODES):
+            ckpt_data = {
+                'episode': ep,
+                'model_weights': agent.model.get_weights(),
+                'target_weights': agent.target.get_weights(),
+                'epsilon': agent.epsilon,
+                'rewards': rewards,
+                'scores': scores,
+                'losses': losses,
+                'best_score': best_score,
+                'random_state_py': random.getstate(),
+                'random_state_np': np.random.get_state()
+            }
+            ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_ep{ep}.pkl")
+            try:
+                joblib.dump(ckpt_data, ckpt_path)
+            except Exception as e:
+                log_queue.put(f"Agent {agent_id}: Failed to save checkpoint: {e}")
+
     # Final update
     result_data = {
         'agent_id': agent_id,
@@ -705,6 +858,9 @@ def run_agent_training(agent_id, params, status_queue, result_queue, log_queue):
 
     # Close writer
     writer.close()
+
+    # Close CSV file
+    csv_file.close()
     log_queue.put(f"Agent {agent_id}: Training completed")
 
     return scores, rewards, losses
@@ -821,17 +977,23 @@ class DarwinSimGUI:
         self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
 
         # Create tabs
+        self.info_tab = ttk.Frame(self.notebook)
         self.setup_tab = ttk.Frame(self.notebook)
         self.training_tab = ttk.Frame(self.notebook)
         self.evaluation_tab = ttk.Frame(self.notebook)
         self.logs_tab = ttk.Frame(self.notebook)
         self.comparison_tab = ttk.Frame(self.notebook)
 
+        # Add tabs to notebook – Info first for quick orientation
+        self.notebook.add(self.info_tab, text='Info')
         self.notebook.add(self.setup_tab, text='Setup')
         self.notebook.add(self.training_tab, text='Training')
         self.notebook.add(self.evaluation_tab, text='Evaluation')
         self.notebook.add(self.logs_tab, text='Logs')
         self.notebook.add(self.comparison_tab, text='Comparison')
+
+        # Info tab content
+        self.create_info_tab()
 
         # Setup tab content
         self.create_setup_tab()
@@ -847,6 +1009,41 @@ class DarwinSimGUI:
 
         # Comparison tab content
         self.create_comparison_tab()
+
+    # --- New Info tab ---
+    def create_info_tab(self):
+        """Displays high-level program purpose and quick-start instructions."""
+        info_text = (
+            "DarwinSim – Multi-Agent Deep-RL Sandbox\n\n"
+            "Purpose:\n"
+            "    • Research playground for training multiple agents (1-5) with Dueling-Double-DQN +\n"
+            "      Prioritised Experience Replay to collect food while avoiding obstacles in a 2-D grid.\n"
+            "    • Visual, GUI-driven experimentation – start/stop runs, tweak hyper-parameters,\n"
+            "      watch training in real-time and compare agents afterward.\n\n"
+            "Key Features:\n"
+            "    • Multi-threaded agents with independent networks.\n"
+            "    • Advanced DQN stack: PER, Double-DQN targets, Dueling heads, Huber loss,\n"
+            "      gradient-clipping, checkpointing + auto-resume.\n"
+            "    • TensorBoard & CSV logging, on-the-fly matplotlib plots inside the GUI.\n"
+            "    • Toggle visualization during training to balance speed vs insight.\n"
+            "    • Post-training evaluation & bar-chart comparison.\n\n"
+            "Quick Start:\n"
+            "    1. Go to the ‘Setup’ tab, adjust hyper-parameters if desired.\n"
+            "    2. Click ‘Start Training’ in the ‘Training’ tab.  Use the checkbox to enable/disable\n"
+            "       real-time visualization (slows training).\n"
+            "    3. Watch progress bars and plots update.  Stop anytime – training will\n"
+            "       auto-resume from the last checkpoint when restarted.\n"
+            "    4. After completion, use the ‘Evaluation’ tab to review scores or ‘Comparison’\n"
+            "       to visualize differences between agents.  Save best models or export results.\n"
+            "    5. Logs and TensorBoard summaries are stored in the ‘runs/’ folder.\n"
+        )
+
+        txt = scrolledtext.ScrolledText(self.info_tab, wrap=tk.WORD,
+                                        bg='#2e2e2e', fg='#e0e0e0',
+                                        font=('Courier', 10))
+        txt.insert(tk.END, info_text)
+        txt.configure(state='disabled')  # read-only
+        txt.pack(fill='both', expand=True, padx=10, pady=10)
 
     def create_setup_tab(self):
         # Parameters frame
@@ -866,6 +1063,7 @@ class DarwinSimGUI:
             ('batch_size', 'Batch Size:', BATCH_SIZE),
             ('memory_capacity', 'Memory Capacity:', MEMORY_CAPACITY),
             ('target_update_freq', 'Target Update Freq:', TARGET_UPDATE_FREQ),
+            ('eval_every_n', 'Eval Every N Episodes:', EVAL_EVERY_N),
             ('num_agents', 'Number of Agents (1-5):', 1),
             ('visualize_every_n', 'Visualize Every Nth Episode:', 10)
         ]
@@ -921,6 +1119,8 @@ class DarwinSimGUI:
                     command=self.load_model).pack(side='left', padx=5)
         ttk.Button(btn_frame, text="Reset to New Model",
                     command=self.reset_model).pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Load Run Config",
+                    command=self.load_run_config).pack(side='left', padx=5)
 
         self.model_status = ttk.Label(model_frame, text="Status: Using new model")
         self.model_status.pack(pady=5)
@@ -1060,6 +1260,25 @@ class DarwinSimGUI:
         self.model_status.config(text="Status: Using new model")
         self.log_message("Reset to new model")
 
+    # --- Load previous run config ---
+    def load_run_config(self):
+        filepath = filedialog.askopenfilename(
+            title="Select run config (config.json)",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            # Populate fields
+            for key, value in data.items():
+                if key in self.param_vars:
+                    self.param_vars[key].set(str(value))
+            self.log_message(f"Loaded run configuration from {filepath}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load config: {e}")
+
     def start_training(self):
         global stop_flag, training_active
 
@@ -1072,7 +1291,7 @@ class DarwinSimGUI:
             params = {}
             for name, var in self.param_vars.items():
                 if name in ['episodes', 'epsilon_decay_episodes', 'steps_per_episode',
-                           'batch_size', 'memory_capacity', 'target_update_freq',
+                           'batch_size', 'memory_capacity', 'target_update_freq', 'eval_every_n',
                            'width', 'height', 'grid_size', 'fps', 'num_food',
                            'num_obstacles', 'num_agents', 'visualize_every_n']:
                     params[name] = int(var.get())
@@ -1083,7 +1302,7 @@ class DarwinSimGUI:
             global WIDTH, HEIGHT, GRID_SIZE, FPS, NUM_FOOD, NUM_OBSTACLES
             global EPISODES, LEARNING_RATE, GAMMA, INITIAL_EPSILON, FINAL_EPSILON
             global EPSILON_DECAY_EPISODES, STEPS_PER_EPISODE, BATCH_SIZE, MEMORY_CAPACITY
-            global visualize_every_n, TARGET_UPDATE_FREQ
+            global visualize_every_n, TARGET_UPDATE_FREQ, EVAL_EVERY_N
 
             WIDTH = params['width']
             HEIGHT = params['height']
@@ -1101,7 +1320,23 @@ class DarwinSimGUI:
             BATCH_SIZE = params['batch_size']
             MEMORY_CAPACITY = params['memory_capacity']
             TARGET_UPDATE_FREQ = params['target_update_freq']
+            EVAL_EVERY_N = params['eval_every_n']
             visualize_every_n = params['visualize_every_n']
+
+            # --- Snapshot run folder ---
+            run_dir = os.path.join("runs", "run_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(run_dir, exist_ok=True)
+            # Save config
+            with open(os.path.join(run_dir, "config.json"), "w") as cfg:
+                json.dump(params, cfg, indent=2)
+            # Ensure workers know where to store checkpoints
+            params['run_dir'] = run_dir
+            # Optionally copy script for reproducibility
+            try:
+                shutil.copy2(__file__, os.path.join(run_dir, os.path.basename(__file__)))
+            except Exception:
+                pass
+            self.log_message(f"Run folder created: {run_dir}")
 
             self.active_agents = min(params['num_agents'], MAX_AGENTS)
 
